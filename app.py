@@ -38,6 +38,12 @@ BORDER_CLR   = "#30363D"
 ACCENT_BLUE  = "#388BFD"
 ACCENT_GREEN = "#3FB950"
 ACCENT_RED   = "#F85149"
+
+def hex_to_rgba(hex_color: str, alpha: float = 0.09) -> str:
+    """Convert a '#RRGGBB' hex color to a Plotly-compatible 'rgba(r,g,b,a)' string."""
+    h = hex_color.lstrip("#")
+    r, g, b = int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16)
+    return f"rgba({r},{g},{b},{alpha})"
 ACCENT_AMBER = "#D29922"
 TEXT_PRIMARY = "#E6EDF3"
 TEXT_MUTED   = "#8B949E"
@@ -914,7 +920,7 @@ def balance_trend_chart(df: pd.DataFrame) -> go.Figure:
 
     fig = go.Figure(go.Scatter(
         x=df_bal["Date"], y=df_bal["Balance"],
-        fill="tozeroy", fillcolor=f"{ACCENT_BLUE}18",
+        fill="tozeroy", fillcolor=hex_to_rgba(ACCENT_BLUE),
         line=dict(color=ACCENT_BLUE, width=2),
         mode="lines",
     ))
@@ -1345,7 +1351,7 @@ def main():
                 fig_p = go.Figure(go.Scatter(
                     x=party_txns_sorted["Date"], y=party_txns_sorted["CumNet"],
                     fill="tozeroy",
-                    fillcolor=f"{ACCENT_GREEN if party_net>=0 else ACCENT_RED}18",
+                    fillcolor=hex_to_rgba(ACCENT_GREEN if party_net >= 0 else ACCENT_RED),
                     line=dict(color=ACCENT_GREEN if party_net >= 0 else ACCENT_RED, width=2),
                     mode="lines+markers",
                 ))
