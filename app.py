@@ -466,7 +466,27 @@ def extract_from_pdf(file_obj) -> pd.DataFrame:
     if not all_rows:
         return pd.DataFrame()
 
-    if header and len(header) == len(all_rows[0]):
+    # Determine a target column width and normalise every row to it.
+    # Real bank-statement PDFs frequently have inconsistent column counts
+    # across rows/pages (merged cells, wrapped text, stray blank columns),
+    # so checking only the first row's length is not reliable.
+    if header:
+        target_width = len(header)
+    else:
+        # Use the most common row length across all extracted rows
+        from collections import Counter
+        target_width = Counter(len(r) for r in all_rows).most_common(1)[0][0]
+
+    def _normalise(row: list, width: int) -> list:
+        if len(row) < width:
+            return row + [""] * (width - len(row))
+        if len(row) > width:
+            return row[:width]
+        return row
+
+    all_rows = [_normalise(r, target_width) for r in all_rows]
+
+    if header and len(header) == target_width:
         df = pd.DataFrame(all_rows, columns=header)
     else:
         df = pd.DataFrame(all_rows)
