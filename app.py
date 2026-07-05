@@ -880,11 +880,10 @@ def opex_donut_chart(df: pd.DataFrame) -> go.Figure:
         hovertemplate="<b>%{label}</b><br>%{value:,.2f}<br>%{percent}<extra></extra>",
     ))
     fig.update_layout(
-        **PLOTLY_LAYOUT,
+        **{**PLOTLY_LAYOUT, "legend": {**PLOTLY_LAYOUT["legend"], "orientation": "v", "font": dict(size=10)}},
         title=dict(text="Expense Distribution by Category", font=dict(size=13), x=0.01),
         height=340,
         showlegend=True,
-        legend=dict(orientation="v", font=dict(size=10), bgcolor="rgba(0,0,0,0)"),
     )
     return fig
 
@@ -901,11 +900,10 @@ def tax_bar_chart(df: pd.DataFrame) -> go.Figure:
     fig.add_trace(go.Bar(x=grp["TaxCategory"], y=grp["Debit"],
                          name="Expense", marker_color=ACCENT_RED, marker_opacity=0.85))
     fig.update_layout(
-        **PLOTLY_LAYOUT,
+        **{**PLOTLY_LAYOUT, "xaxis": {**PLOTLY_LAYOUT["xaxis"], "tickangle": -25, "tickfont": dict(size=9)}},
         barmode="group",
         title=dict(text="Tax Category Breakdown", font=dict(size=13), x=0.01),
         height=340,
-        xaxis=dict(tickangle=-25, tickfont=dict(size=9)),
     )
     return fig
 
@@ -928,7 +926,6 @@ def balance_trend_chart(df: pd.DataFrame) -> go.Figure:
         **PLOTLY_LAYOUT,
         title=dict(text="Running Balance", font=dict(size=13), x=0.01),
         height=250,
-        yaxis=dict(gridcolor=BORDER_CLR, linecolor=BORDER_CLR),
     )
     return fig
 
@@ -1412,11 +1409,10 @@ def main():
                     marker_opacity=0.85,
                 ))
                 fig_flags.update_layout(
-                    **PLOTLY_LAYOUT,
+                    **{**PLOTLY_LAYOUT, "yaxis": {**PLOTLY_LAYOUT["yaxis"], "tickfont": dict(size=10)}},
                     height=220,
                     title=dict(text="Flag Type Distribution", font=dict(size=13), x=0.01),
                     xaxis_title="Count",
-                    yaxis=dict(tickfont=dict(size=10)),
                 )
                 st.plotly_chart(fig_flags, use_container_width=True)
 
