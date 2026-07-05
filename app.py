@@ -812,6 +812,103 @@ def build_party_ledger(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
     return grp, net
 
 
+def build_excel_report(df: pd.DataFrame, table_a: pd.DataFrame, table_b: pd.DataFrame) -> bytes:
+    """
+    Build a single multi-sheet Excel workbook mirroring the dashboard's tabs:
+      - All Transactions           (full detail, master reference)
+      - Tax Segregation            (TaxCategory summary)
+      - OPEX Segregation           (OpexCategory summary)
+      - Party Ledger               (gross volume per counterparty)
+      - Party Netting              (net position per counterparty)
+      - Risk & Anomaly Register    (flagged transactions only)
+    Returns raw .xlsx bytes suitable for st.download_button.
+    """
+    from openpyxl.styles import Font, PatternFill, Alignment
+    from openpyxl.utils import get_column_letter
+
+    # ---- Sheet 1: All Transactions -----------------------------------------
+    all_txns = df[["Date", "Description", "Counterparty", "Debit", "Credit", "Balance",
+                   "TaxCategory", "OpexCategory", "FlagsStr", "Severity"]].copy()
+    all_txns["Date"] = pd.to_datetime(all_txns["Date"]).dt.date
+    all_txns.rename(columns={"FlagsStr": "Flags Triggered", "Severity": "Risk Level"}, inplace=True)
+
+    # ---- Sheet 2: Tax Segregation -------------------------------------------
+    tax_seg = (
+        df.groupby("TaxCategory")
+        .agg(TxnCount=("Description", "count"), TotalCredit=("Credit", "sum"), TotalDebit=("Debit", "sum"))
+        .reset_index()
+        .sort_values("TotalCredit", ascending=False)
+    )
+    tax_seg["NetFlow"] = tax_seg["TotalCredit"] - tax_seg["TotalDebit"]
+    tax_seg.columns = ["Tax Category", "Txn Count", "Total Credit", "Total Debit", "Net Flow"]
+
+    # ---- Sheet 3: OPEX Segregation -------------------------------------------
+    opex_seg = (
+        df.groupby("OpexCategory")
+        .agg(TxnCount=("Description", "count"), TotalDebit=("Debit", "sum"))
+        .reset_index()
+        .sort_values("TotalDebit", ascending=False)
+    )
+    opex_total = opex_seg["TotalDebit"].sum()
+    opex_seg["% of Spend"] = (opex_seg["TotalDebit"] / opex_total * 100).round(2) if opex_total else 0.0
+    opex_seg.columns = ["OPEX Category", "Txn Count", "Total Spend", "% of Spend"]
+
+    # ---- Sheet 6: Risk & Anomaly Register -----------------------------------
+    flagged = df[df["FlagCount"] > 0][["Date", "Description", "Counterparty", "Debit", "Credit",
+                                        "FlagsStr", "Severity"]].copy()
+    flagged["Date"] = pd.to_datetime(flagged["Date"]).dt.date
+    sev_rank = {"HIGH": 0, "MEDIUM": 1, "LOW": 2, "": 3}
+    flagged = flagged.sort_values(by="Severity", key=lambda s: s.map(sev_rank).fillna(3))
+    flagged.rename(columns={"FlagsStr": "Flags Triggered", "Severity": "Risk Level"}, inplace=True)
+
+    sheets = {
+        "All Transactions":        all_txns,
+        "Tax Segregation":         tax_seg,
+        "OPEX Segregation":        opex_seg,
+        "Party Ledger":            table_a,
+        "Party Netting":           table_b,
+        "Risk & Anomaly Register": flagged,
+    }
+
+    currency_headers = {"Debit", "Credit", "Balance", "Total Credit", "Total Debit",
+                         "Net Flow", "Total Spend"}
+
+    buffer = io.BytesIO()
+    with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
+        for name, sheet_df in sheets.items():
+            sheet_df.to_excel(writer, sheet_name=name[:31], index=False)
+
+        header_fill = PatternFill(start_color="1F2937", end_color="1F2937", fill_type="solid")
+        header_font = Font(color="FFFFFF", bold=True)
+
+        for name, sheet_df in sheets.items():
+            ws = writer.sheets[name[:31]]
+            if ws.max_row < 1 or ws.max_column < 1:
+                continue
+            ws.freeze_panes = "A2"
+            ws.auto_filter.ref = ws.dimensions
+            max_row = ws.max_row
+
+            for col_idx, col_name in enumerate(sheet_df.columns, start=1):
+                col_letter = get_column_letter(col_idx)
+                cell = ws.cell(row=1, column=col_idx)
+                cell.font = header_font
+                cell.fill = header_fill
+                cell.alignment = Alignment(horizontal="center")
+
+                max_len = max(
+                    [len(str(col_name))] + [len(str(v)) for v in sheet_df[col_name].astype(str).values]
+                    if len(sheet_df) else [len(str(col_name))]
+                )
+                ws.column_dimensions[col_letter].width = min(max_len + 3, 45)
+
+                if col_name in currency_headers:
+                    for row in range(2, max_row + 1):
+                        ws.cell(row=row, column=col_idx).number_format = "#,##0.00"
+
+    return buffer.getvalue()
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # CHART BUILDERS
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1151,6 +1248,24 @@ def main():
     flag_count   = (df["FlagCount"] > 0).sum()
     date_range   = f"{df['Date'].min().strftime('%d %b %Y')} → {df['Date'].max().strftime('%d %b %Y')}"
 
+    # Party ledger tables (computed once, reused in Tab 3 and the Excel export)
+    table_a, table_b = build_party_ledger(df)
+
+    # ── EXPORT ────────────────────────────────────────────────────────────────
+    col_title, col_export = st.columns([5, 1.3])
+    with col_title:
+        st.markdown(f'<div style="padding-top:0.4rem;font-size:0.82rem;color:{TEXT_MUTED}">'
+                    f'{txn_count} transactions · {date_range}</div>', unsafe_allow_html=True)
+    with col_export:
+        excel_bytes = build_excel_report(df, table_a, table_b)
+        st.download_button(
+            "⬇️ Export to Excel",
+            data=excel_bytes,
+            file_name=f"AuditLens_Report_{datetime.date.today().isoformat()}.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            use_container_width=True,
+        )
+
     # ── TAB LAYOUT ────────────────────────────────────────────────────────────
     tab1, tab2, tab3, tab4 = st.tabs([
         "📊 Executive Dashboard",
@@ -1280,8 +1395,6 @@ def main():
         )
 
         st.markdown("<br>", unsafe_allow_html=True)
-
-        table_a, table_b = build_party_ledger(df)
 
         col_a, col_b = st.columns(2)
 
