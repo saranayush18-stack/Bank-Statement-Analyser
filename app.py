@@ -341,35 +341,90 @@ COLUMN_ALIASES = {
                     "transaction details", "trans desc", "trans narration", "note",
                     "narrative", "memo", "reference"],
     "debit":       ["debit", "dr", "withdrawal", "paid out", "debit amount", "amount debited",
-                    "dr amount", "withdrawals", "debits", "expense", "dr."],
+                    "dr amount", "withdrawals", "debits", "expense", "dr.", "withdrawal amt",
+                    "withdrawal amount", "amount withdrawn"],
     "credit":      ["credit", "cr", "deposit", "paid in", "credit amount", "amount credited",
-                    "cr amount", "deposits", "credits", "income", "cr."],
+                    "cr amount", "deposits", "credits", "income", "cr.", "deposit amt",
+                    "deposit amount", "amount deposited"],
     "balance":     ["balance", "closing balance", "running balance", "avail balance",
                     "balance amount", "bal", "ledger balance", "available balance"],
+    "amount":      ["amount", "transaction amount", "txn amount", "amt", "value", "amount (inr)",
+                    "amount(inr)"],
+    "type":        ["dr/cr", "cr/dr", "drcr", "cr dr", "dr cr", "type", "dc", "d/c", "c/d",
+                    "transaction type", "indicator", "cd", "txn type"],
 }
 
 
 def _match_column(col_name: str, target_group: str) -> bool:
-    """Case-insensitive fuzzy match between a df column and a target group."""
+    """
+    Case-insensitive match between a df column and a target group.
+
+    Only checks whether a known alias phrase is fully contained within the
+    column name (handles verbose headers like "Debit Amount (INR)"), plus a
+    strict fuzzy-ratio check. Deliberately does NOT check the reverse
+    direction (column name contained within alias) — that caused short
+    generic headers like "Amount" to be swallowed into unrelated groups
+    such as "debit", since multi-word aliases like "debit amount" or
+    "amount debited" contain the substring "amount" inside them.
+    """
     col_clean = col_name.lower().strip()
     for alias in COLUMN_ALIASES.get(target_group, []):
-        if alias in col_clean or col_clean in alias:
+        if alias == col_clean or alias in col_clean:
             return True
-        if fuzz.ratio(col_clean, alias) > 78:
+        if fuzz.ratio(col_clean, alias) > 85:
             return True
     return False
 
 
 def normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
-    """Map arbitrary column names → [Date, Description, Debit, Credit, Balance]."""
+    """
+    Map arbitrary column names → [Date, Description, Debit, Credit, Balance].
+
+    Handles three common bank-statement layouts:
+      1. Separate Debit and Credit columns (or Withdrawal/Deposit) — most common.
+      2. A single Amount column + a separate Dr/Cr "Type" indicator column.
+      3. A single signed Amount column with no indicator (negative = debit,
+         positive = credit) — used as a last-resort interpretation only.
+    """
     rename_map = {}
+    matched_groups = set()
     for col in df.columns:
-        for group in ["date", "description", "debit", "credit", "balance"]:
-            if group not in [v.lower() for v in rename_map.values()] and _match_column(str(col), group):
+        for group in ["date", "description", "debit", "credit", "balance", "amount", "type"]:
+            if group not in matched_groups and _match_column(str(col), group):
                 rename_map[col] = group.capitalize() if group != "description" else "Description"
+                matched_groups.add(group)
                 break
 
     df = df.rename(columns=rename_map)
+
+    has_debit_credit = "Debit" in df.columns and "Credit" in df.columns
+    has_amount = "Amount" in df.columns
+
+    if has_amount and not has_debit_credit:
+        if "Type" in df.columns:
+            # Layout: single Amount column + Dr/Cr indicator column
+            debit_vals, credit_vals = [], []
+            for amt, typ in zip(df["Amount"], df["Type"]):
+                a = parse_amount(amt)
+                t = str(typ).strip().lower()
+                is_debit  = t.startswith("d") or "dr" in t or "debit" in t or "withdraw" in t
+                is_credit = t.startswith("c") or "cr" in t or "credit" in t or "deposit" in t
+                if is_debit and not is_credit:
+                    debit_vals.append(abs(a)); credit_vals.append(0.0)
+                elif is_credit:
+                    debit_vals.append(0.0); credit_vals.append(abs(a))
+                else:
+                    # Indicator unrecognised — fall back to sign of amount
+                    debit_vals.append(abs(a) if a < 0 else 0.0)
+                    credit_vals.append(a if a > 0 else 0.0)
+            df["Debit"]  = debit_vals
+            df["Credit"] = credit_vals
+        else:
+            # Layout: single signed Amount column, no indicator at all
+            amounts = df["Amount"].apply(parse_amount)
+            df["Debit"]  = amounts.apply(lambda v: abs(v) if v < 0 else 0.0)
+            df["Credit"] = amounts.apply(lambda v: v if v > 0 else 0.0)
+
     # Ensure mandatory columns exist
     for required in ["Date", "Description", "Debit", "Credit"]:
         if required not in df.columns:
@@ -430,22 +485,49 @@ def clean_dataframe(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
+TABLE_STRATEGIES = [
+    {"vertical_strategy": "lines",   "horizontal_strategy": "lines"},    # bordered/ruled tables
+    {"vertical_strategy": "text",    "horizontal_strategy": "text"},     # whitespace-aligned, no borders
+    {"vertical_strategy": "lines",   "horizontal_strategy": "text"},     # mixed layouts
+    {"vertical_strategy": "text",    "horizontal_strategy": "lines"},
+]
+
+
 def extract_from_pdf(file_obj) -> pd.DataFrame:
-    """Extract tabular data from text-based PDFs using pdfplumber."""
+    """
+    Extract tabular data from text-based PDFs using pdfplumber.
+
+    Bank statement PDFs vary a lot: some have fully ruled/bordered tables,
+    others (very common with netbanking exports) use pure whitespace
+    alignment with no visible lines at all. This tries several pdfplumber
+    table-detection strategies per page, and falls back to a whitespace
+    text-line parser if none of them find a table.
+    """
     all_rows = []
     header = None
+
     with pdfplumber.open(file_obj) as pdf:
         for page in pdf.pages:
-            tables = page.extract_tables()
+            tables = []
+            for settings in TABLE_STRATEGIES:
+                try:
+                    tables = page.extract_tables(table_settings=settings)
+                except Exception:
+                    tables = []
+                if tables:
+                    break
+
             for table in tables:
                 if not table:
                     continue
                 # Try to detect header row
                 if header is None:
                     first_row = [str(c).strip() if c else "" for c in table[0]]
-                    # Check if first row looks like a header
                     has_date = any(_match_column(c, "date") for c in first_row)
-                    has_amount = any(_match_column(c, "debit") or _match_column(c, "credit") for c in first_row)
+                    has_amount = any(
+                        _match_column(c, "debit") or _match_column(c, "credit") or _match_column(c, "amount")
+                        for c in first_row
+                    )
                     if has_date and has_amount:
                         header = first_row
                         data_rows = table[1:]
@@ -463,6 +545,12 @@ def extract_from_pdf(file_obj) -> pd.DataFrame:
                     if any(cleaned):
                         all_rows.append(cleaned)
 
+    # Fallback: no table structure detected at all by any pdfplumber strategy.
+    # Common with plain netbanking-exported statements that have no ruling
+    # lines — parse each text line by splitting on runs of whitespace instead.
+    if not all_rows:
+        all_rows, header = _extract_via_text_lines(file_obj)
+
     if not all_rows:
         return pd.DataFrame()
 
@@ -473,7 +561,6 @@ def extract_from_pdf(file_obj) -> pd.DataFrame:
     if header:
         target_width = len(header)
     else:
-        # Use the most common row length across all extracted rows
         from collections import Counter
         target_width = Counter(len(r) for r in all_rows).most_common(1)[0][0]
 
@@ -493,6 +580,47 @@ def extract_from_pdf(file_obj) -> pd.DataFrame:
         df.columns = [f"col_{i}" for i in range(len(df.columns))]
 
     return df
+
+
+def _extract_via_text_lines(file_obj) -> tuple[list, list | None]:
+    """
+    Last-resort structural fallback for PDFs with no detectable table lines
+    at all (common with plain-text netbanking statement exports). Splits
+    each line of extracted text on runs of 2+ spaces/tabs, keeping lines
+    that start with a plausible date token as transaction rows. Returns
+    (rows, header) where header may be None if no header line was found.
+    """
+    date_start_re = re.compile(
+        r"^\s*(\d{1,2}[-/.]\d{1,2}[-/.]\d{2,4}|\d{4}[-/.]\d{1,2}[-/.]\d{1,2}|"
+        r"\d{1,2}[-\s][A-Za-z]{3,9}[-\s]\d{2,4})"
+    )
+    rows = []
+    header = None
+    try:
+        file_obj.seek(0)
+        with pdfplumber.open(file_obj) as pdf:
+            for page in pdf.pages:
+                text = page.extract_text() or ""
+                for line in text.split("\n"):
+                    line = line.strip()
+                    if not line:
+                        continue
+                    parts = [p.strip() for p in re.split(r"\s{2,}|\t+", line) if p.strip()]
+                    if len(parts) < 3:
+                        continue
+                    if header is None:
+                        has_date = any(_match_column(p, "date") for p in parts)
+                        has_amt  = any(
+                            _match_column(p, g) for p in parts for g in ["debit", "credit", "amount", "balance"]
+                        )
+                        if has_date and has_amt:
+                            header = parts
+                            continue
+                    if date_start_re.match(line):
+                        rows.append(parts)
+    except Exception:
+        return [], None
+    return rows, header
 
 
 def extract_from_csv(file_obj) -> pd.DataFrame:
