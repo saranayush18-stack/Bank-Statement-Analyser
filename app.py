@@ -486,11 +486,118 @@ def clean_dataframe(df: pd.DataFrame) -> pd.DataFrame:
 
 
 TABLE_STRATEGIES = [
-    {"vertical_strategy": "lines",   "horizontal_strategy": "lines"},    # bordered/ruled tables
-    {"vertical_strategy": "text",    "horizontal_strategy": "text"},     # whitespace-aligned, no borders
-    {"vertical_strategy": "lines",   "horizontal_strategy": "text"},     # mixed layouts
-    {"vertical_strategy": "text",    "horizontal_strategy": "lines"},
-]
+    {"vertical_strategy": "lines", "horizontal_strategy": "lines"},   # bordered/ruled tables only —
+]                                                                      # deliberately NOT using pdfplumber's
+                                                                        # "text" whitespace-guessing strategy;
+                                                                        # see _extract_via_word_positions below.
+
+
+def _extract_via_word_positions(file_obj) -> tuple[list, list | None]:
+    """
+    Robust fallback for PDFs with no ruling lines at all (very common with
+    netbanking-exported statements). Uses each page's real embedded-text
+    word coordinates (pdfplumber's extract_words) rather than pdfplumber's
+    built-in "text" table-detection strategy — that built-in strategy
+    guesses column boundaries from whitespace and can slice a table at the
+    wrong x-position on proportional-font text, occasionally splitting a
+    word like "Description" into "Descrip"/"tion" mid-word and silently
+    producing garbled columns.
+
+    Column boundaries are anchored to the header row, but as the MIDPOINT
+    of the gap between each pair of adjacent header words (using their
+    actual left/right text edges) rather than each header word's raw start
+    position. A left-aligned header label and a right-aligned numeric
+    column both need this: numeric amount columns are usually right-
+    aligned, so a short header word like "Debit" and a longer data value
+    like "150000.00" anchor to the same right edge but start at very
+    different x-positions — using the header word's start position alone
+    as the column boundary would misjudge where the real data can begin.
+    Each data word is then bucketed by its own horizontal CENTER (not its
+    start) against these midpoint cutoffs, which is symmetric regardless
+    of whether a given column happens to be left- or right-aligned.
+    """
+    import bisect
+
+    GAP_PT = 8  # points; real embedded text has crisp coordinates, unlike OCR pixels
+
+    def _cluster_line(words):
+        """Group words on one line into column-like clusters by x-gap.
+        Returns (left, right, text) tuples — used only to locate/parse the
+        header row, not to assign data rows (see module docstring above)."""
+        words = sorted(words, key=lambda w: w["x0"])
+        cols = []
+        cur_words, cur_left, cur_right = [words[0]["text"]], words[0]["x0"], words[0]["x1"]
+        for w in words[1:]:
+            if w["x0"] - cur_right > GAP_PT:
+                cols.append((cur_left, cur_right, " ".join(cur_words)))
+                cur_words, cur_left, cur_right = [w["text"]], w["x0"], w["x1"]
+            else:
+                cur_words.append(w["text"])
+                cur_right = w["x1"]
+            cur_right = max(cur_right, w["x1"])
+        cols.append((cur_left, cur_right, " ".join(cur_words)))
+        return cols
+
+    def _assign_words_to_columns(words, cutoffs, n_cols):
+        row = [""] * n_cols
+        for w in sorted(words, key=lambda w: w["x0"]):
+            center = (w["x0"] + w["x1"]) / 2
+            idx = bisect.bisect_right(cutoffs, center)
+            idx = max(0, min(idx, n_cols - 1))
+            row[idx] = (row[idx] + " " + w["text"]).strip() if row[idx] else w["text"]
+        return row
+
+    all_rows, header_cutoffs, n_cols, header_labels = [], None, None, None
+    try:
+        file_obj.seek(0)
+        with pdfplumber.open(file_obj) as pdf:
+            for page in pdf.pages:
+                words = page.extract_words(x_tolerance=1.5)
+                if not words:
+                    continue
+                # Group words into lines by y-position (rounded 'top'), merging
+                # rows within a small tolerance to absorb minor font-metric jitter.
+                by_top: dict = {}
+                for w in words:
+                    by_top.setdefault(round(w["top"]), []).append(w)
+                keys = sorted(by_top.keys())
+                used, line_groups = set(), []
+                for k in keys:
+                    if k in used:
+                        continue
+                    group = [k]
+                    for k2 in keys:
+                        if k2 != k and k2 not in used and abs(k2 - k) <= 3:
+                            group.append(k2); used.add(k2)
+                    used.add(k)
+                    line_groups.append(group)
+
+                for keys_grp in line_groups:
+                    ws = [w for k in keys_grp for w in by_top[k]]
+                    cols = _cluster_line(ws)
+                    if len(cols) < 2:
+                        continue
+                    texts = [c[2].lower() for c in cols]
+                    is_header = (
+                        header_cutoffs is None
+                        and any(_match_column(t, "date") for t in texts)
+                        and any(_match_column(t, g) for t in texts for g in ["debit", "credit", "balance", "amount"])
+                    )
+                    if is_header:
+                        header_cutoffs = [(cols[i][1] + cols[i + 1][0]) / 2 for i in range(len(cols) - 1)]
+                        header_labels = [c[2] for c in cols]
+                        n_cols = len(cols)
+                        continue
+                    if header_cutoffs:
+                        row = _assign_words_to_columns(ws, header_cutoffs, n_cols)
+                    else:
+                        row = [c[2] for c in cols]
+                    if sum(1 for v in row if str(v).strip()) >= 2:
+                        all_rows.append(row)
+    except Exception:
+        return [], None
+
+    return all_rows, header_labels
 
 
 def extract_from_pdf(file_obj) -> pd.DataFrame:
@@ -499,9 +606,11 @@ def extract_from_pdf(file_obj) -> pd.DataFrame:
 
     Bank statement PDFs vary a lot: some have fully ruled/bordered tables,
     others (very common with netbanking exports) use pure whitespace
-    alignment with no visible lines at all. This tries several pdfplumber
-    table-detection strategies per page, and falls back to a whitespace
-    text-line parser if none of them find a table.
+    alignment with no visible lines at all. This first tries pdfplumber's
+    line-based table detection (reliable for genuinely bordered tables),
+    and falls back to a coordinate-based word-position parser for anything
+    without ruling lines — see _extract_via_word_positions for why that's
+    used instead of pdfplumber's built-in whitespace-guessing strategy.
     """
     all_rows = []
     header = None
@@ -545,11 +654,11 @@ def extract_from_pdf(file_obj) -> pd.DataFrame:
                     if any(cleaned):
                         all_rows.append(cleaned)
 
-    # Fallback: no table structure detected at all by any pdfplumber strategy.
-    # Common with plain netbanking-exported statements that have no ruling
-    # lines — parse each text line by splitting on runs of whitespace instead.
+    # Fallback: no bordered/ruled table detected at all — common with plain
+    # netbanking-exported statements. Use the coordinate-based word-position
+    # parser instead of pdfplumber's flaky whitespace-guessing strategy.
     if not all_rows:
-        all_rows, header = _extract_via_text_lines(file_obj)
+        all_rows, header = _extract_via_word_positions(file_obj)
 
     if not all_rows:
         return pd.DataFrame()
@@ -580,47 +689,6 @@ def extract_from_pdf(file_obj) -> pd.DataFrame:
         df.columns = [f"col_{i}" for i in range(len(df.columns))]
 
     return df
-
-
-def _extract_via_text_lines(file_obj) -> tuple[list, list | None]:
-    """
-    Last-resort structural fallback for PDFs with no detectable table lines
-    at all (common with plain-text netbanking statement exports). Splits
-    each line of extracted text on runs of 2+ spaces/tabs, keeping lines
-    that start with a plausible date token as transaction rows. Returns
-    (rows, header) where header may be None if no header line was found.
-    """
-    date_start_re = re.compile(
-        r"^\s*(\d{1,2}[-/.]\d{1,2}[-/.]\d{2,4}|\d{4}[-/.]\d{1,2}[-/.]\d{1,2}|"
-        r"\d{1,2}[-\s][A-Za-z]{3,9}[-\s]\d{2,4})"
-    )
-    rows = []
-    header = None
-    try:
-        file_obj.seek(0)
-        with pdfplumber.open(file_obj) as pdf:
-            for page in pdf.pages:
-                text = page.extract_text() or ""
-                for line in text.split("\n"):
-                    line = line.strip()
-                    if not line:
-                        continue
-                    parts = [p.strip() for p in re.split(r"\s{2,}|\t+", line) if p.strip()]
-                    if len(parts) < 3:
-                        continue
-                    if header is None:
-                        has_date = any(_match_column(p, "date") for p in parts)
-                        has_amt  = any(
-                            _match_column(p, g) for p in parts for g in ["debit", "credit", "amount", "balance"]
-                        )
-                        if has_date and has_amt:
-                            header = parts
-                            continue
-                    if date_start_re.match(line):
-                        rows.append(parts)
-    except Exception:
-        return [], None
-    return rows, header
 
 
 def extract_from_csv(file_obj) -> pd.DataFrame:
@@ -674,23 +742,91 @@ def load_and_parse(uploaded_file) -> pd.DataFrame:
 
 
 def _ocr_fallback(raw_bytes: bytes) -> pd.DataFrame:
-    """Last-resort OCR via pytesseract for scanned PDFs."""
+    """
+    Last-resort OCR via pytesseract for scanned/image-only PDFs.
+
+    Tesseract's plain-text output collapses wide column gaps down to single
+    spaces, so a naive "split on runs of whitespace" parser silently
+    scrambles tabular data (and Tesseract's default page segmentation mode
+    also tends to read wide-gapped columns as separate blocks, column-by-
+    column, rather than row-by-row). To avoid both problems this uses
+    word-level bounding-box data (image_to_data) instead of the plain string
+    output: words are grouped into lines by Tesseract's own line numbering,
+    then clustered into columns by x-gap. The header row's column x-
+    positions are then used as fixed anchors so that every later row is
+    assigned to the correct column even when a cell (e.g. Debit or Credit)
+    is blank — sequential clustering alone would otherwise collapse blank
+    cells and shift every value after them into the wrong column.
+    """
     try:
         import pytesseract
-        from PIL import Image
         import pdf2image
+        import bisect
+
         images = pdf2image.convert_from_bytes(raw_bytes, dpi=250)
-        texts  = [pytesseract.image_to_string(img) for img in images]
-        # Very simple line parser for OCR output
-        rows = []
-        for text in texts:
-            for line in text.split("\n"):
-                parts = re.split(r"\s{2,}", line.strip())
-                if len(parts) >= 3:
-                    rows.append(parts)
-        if rows:
-            max_cols = max(len(r) for r in rows)
-            df = pd.DataFrame([r + [""] * (max_cols - len(r)) for r in rows])
+        gap_threshold = 40  # px at 250 DPI; separates same-column word-wrap from a true new column
+
+        def _cluster_line(words):
+            words = sorted(words, key=lambda w: w["left"])
+            cols, cur_words, cur_lefts = [], [words[0]["text"]], [words[0]["left"]]
+            cur_right = words[0]["left"] + words[0]["width"]
+            for w in words[1:]:
+                if w["left"] - cur_right > gap_threshold:
+                    cols.append((min(cur_lefts), " ".join(cur_words)))
+                    cur_words, cur_lefts = [w["text"]], [w["left"]]
+                else:
+                    cur_words.append(w["text"]); cur_lefts.append(w["left"])
+                cur_right = w["left"] + w["width"]
+            cols.append((min(cur_lefts), " ".join(cur_words)))
+            return cols
+
+        def _assign_to_columns(cols, boundaries):
+            row = [""] * len(boundaries)
+            for left, text in cols:
+                idx = bisect.bisect_right(boundaries, left + 15) - 1
+                idx = max(0, min(idx, len(boundaries) - 1))
+                row[idx] = (row[idx] + " " + text).strip() if row[idx] else text
+            return row
+
+        all_rows, header_boundaries, header_labels = [], None, None
+
+        for img in images:
+            data = pytesseract.image_to_data(img, config="--psm 6", output_type=pytesseract.Output.DATAFRAME)
+            data = data[(data["conf"].astype(float) > 0) & data["text"].notna()
+                        & (data["text"].astype(str).str.strip() != "")]
+            if data.empty:
+                continue
+
+            lines = []
+            for _, grp in data.groupby(["block_num", "par_num", "line_num"]):
+                cols = _cluster_line(grp.to_dict("records"))
+                if len(cols) >= 2:
+                    lines.append(cols)
+
+            for cols in lines:
+                texts = [c[1].lower() for c in cols]
+                is_header = (
+                    header_boundaries is None
+                    and any(_match_column(t, "date") for t in texts)
+                    and any(_match_column(t, g) for t in texts for g in ["debit", "credit", "balance", "amount"])
+                )
+                if is_header:
+                    header_boundaries = [c[0] for c in cols]
+                    header_labels = [c[1] for c in cols]
+                    continue
+                if header_boundaries:
+                    row = _assign_to_columns(cols, header_boundaries)
+                else:
+                    row = [c[1] for c in cols]
+                if sum(1 for v in row if str(v).strip()) >= 2:
+                    all_rows.append(row)
+
+        if all_rows:
+            max_cols = max(len(r) for r in all_rows)
+            all_rows = [r + [""] * (max_cols - len(r)) for r in all_rows]
+            df = pd.DataFrame(all_rows)
+            if header_labels and len(header_labels) == max_cols:
+                df.columns = header_labels
             return df
     except Exception as e:
         st.warning(f"OCR fallback failed: {e}")
