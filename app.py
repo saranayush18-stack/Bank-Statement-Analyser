@@ -796,6 +796,129 @@ def load_and_parse(uploaded_file) -> pd.DataFrame:
     return cleaned
 
 
+def merge_and_dedupe_statements(dfs: list, filenames: list) -> tuple:
+    """
+    Merge multiple statement parts into one chronological, duplicate-free
+    transaction log. This is common when a bank exports a long history as
+    several overlapping-date-range PDFs (e.g. Apr–May, then May–Aug, then
+    Aug–Oct) — the overlap windows mean the same transactions appear in more
+    than one file.
+
+    A transaction is treated as a duplicate of one already kept if its
+    Date, Debit, Credit, and Balance all match exactly — the running
+    Balance makes a false-positive collision between two genuinely distinct
+    transactions extremely unlikely — AND its Description is a close fuzzy
+    match, which guards against the rare coincidence of two distinct
+    transactions sharing the same date/amounts/balance.
+
+    Returns (deduped_df, stats) where stats includes per-file transaction
+    counts/date-ranges, how many duplicates were removed, and any detected
+    coverage gaps between consecutive files' date ranges.
+    """
+    tagged, per_file_stats = [], []
+    for fname, d in zip(filenames, dfs):
+        if d is None or d.empty:
+            per_file_stats.append({"File": fname, "Transactions": 0, "Start": None, "End": None})
+            continue
+        d = d.copy()
+        d["SourceFile"] = fname
+        tagged.append(d)
+        per_file_stats.append({
+            "File": fname, "Transactions": len(d),
+            "Start": d["Date"].min(), "End": d["Date"].max(),
+        })
+
+    if not tagged:
+        return pd.DataFrame(), {
+            "per_file": per_file_stats, "total_before": 0,
+            "duplicates_removed": 0, "total_after": 0, "gaps": [],
+        }
+
+    combined = pd.concat(tagged, ignore_index=True)
+    combined = combined.sort_values("Date", kind="stable").reset_index(drop=True)
+    total_before = len(combined)
+
+    seen, keep = {}, []
+    for _, row in combined.iterrows():
+        key = (row["Date"], round(float(row["Debit"]), 2),
+               round(float(row["Credit"]), 2), round(float(row["Balance"]), 2))
+        desc = str(row.get("Description", "")).strip().lower()
+        if key in seen and fuzz.ratio(desc, seen[key]) >= 75:
+            keep.append(False)
+        else:
+            seen[key] = desc
+            keep.append(True)
+
+    deduped = combined[keep].reset_index(drop=True)
+    total_after = len(deduped)
+
+    # Flag likely coverage gaps: a stretch of time not covered by any file
+    ranges = sorted(
+        [(s["Start"], s["End"], s["File"]) for s in per_file_stats if s["Start"] is not None],
+        key=lambda r: r[0],
+    )
+    gaps = []
+    for i in range(len(ranges) - 1):
+        cur_end, next_start = ranges[i][1], ranges[i + 1][0]
+        if pd.notna(cur_end) and pd.notna(next_start) and (next_start - cur_end).days > 1:
+            gaps.append({
+                "after_file": ranges[i][2], "before_file": ranges[i + 1][2],
+                "gap_start": cur_end, "gap_end": next_start,
+            })
+
+    stats = {
+        "per_file": per_file_stats,
+        "total_before": total_before,
+        "duplicates_removed": total_before - total_after,
+        "total_after": total_after,
+        "gaps": gaps,
+    }
+    return deduped, stats
+
+
+def get_financial_year(date) -> str:
+    """Indian financial year label (April–March) for a given date."""
+    d = pd.Timestamp(date)
+    start_year = d.year if d.month >= 4 else d.year - 1
+    return f"FY {start_year}-{str(start_year + 1)[-2:]}"
+
+
+def build_annual_summary(df: pd.DataFrame) -> tuple:
+    """
+    Build a Financial-Year-wise summary and a month-wise breakdown across
+    the full (possibly multi-year, possibly merged-from-multiple-files)
+    transaction history.
+    """
+    d = df.copy()
+    d["FY"] = d["Date"].apply(get_financial_year)
+    d["MonthPeriod"] = d["Date"].dt.to_period("M")
+
+    fy_summary = (
+        d.groupby("FY")
+        .agg(TotalCredit=("Credit", "sum"), TotalDebit=("Debit", "sum"),
+             TxnCount=("Description", "count"), PeriodStart=("Date", "min"), PeriodEnd=("Date", "max"))
+        .reset_index()
+        .sort_values("PeriodStart")
+    )
+    fy_summary["NetFlow"] = fy_summary["TotalCredit"] - fy_summary["TotalDebit"]
+    fy_summary = fy_summary[["FY", "PeriodStart", "PeriodEnd", "TxnCount", "TotalCredit", "TotalDebit", "NetFlow"]]
+    fy_summary.columns = ["Financial Year", "Period Start", "Period End", "Txn Count",
+                           "Total Credit", "Total Debit", "Net Flow"]
+
+    month_summary = (
+        d.groupby("MonthPeriod")
+        .agg(TotalCredit=("Credit", "sum"), TotalDebit=("Debit", "sum"), TxnCount=("Description", "count"))
+        .reset_index()
+        .sort_values("MonthPeriod")
+    )
+    month_summary["NetFlow"] = month_summary["TotalCredit"] - month_summary["TotalDebit"]
+    month_summary["Month"] = month_summary["MonthPeriod"].dt.strftime("%b %Y")
+    month_summary = month_summary[["Month", "TxnCount", "TotalCredit", "TotalDebit", "NetFlow"]]
+    month_summary.columns = ["Month", "Txn Count", "Total Credit", "Total Debit", "Net Flow"]
+
+    return fy_summary, month_summary
+
+
 def _ocr_fallback(raw_bytes: bytes) -> pd.DataFrame:
     """
     Last-resort OCR via pytesseract for scanned/image-only PDFs.
@@ -1202,6 +1325,12 @@ def build_excel_report(df: pd.DataFrame, table_a: pd.DataFrame, table_b: pd.Data
     flagged = flagged.sort_values(by="Severity", key=lambda s: s.map(sev_rank).fillna(3))
     flagged.rename(columns={"FlagsStr": "Flags Triggered", "Severity": "Risk Level"}, inplace=True)
 
+    # ---- Sheet 7 & 8: Annual Summary (Financial Year + Month-wise) ---------
+    fy_summary, month_summary = build_annual_summary(df)
+    fy_seg = fy_summary.copy()
+    fy_seg["Period Start"] = pd.to_datetime(fy_seg["Period Start"]).dt.date
+    fy_seg["Period End"]   = pd.to_datetime(fy_seg["Period End"]).dt.date
+
     sheets = {
         "All Transactions":        all_txns,
         "Tax Segregation":         tax_seg,
@@ -1209,6 +1338,8 @@ def build_excel_report(df: pd.DataFrame, table_a: pd.DataFrame, table_b: pd.Data
         "Party Ledger":            table_a,
         "Party Netting":           table_b,
         "Risk & Anomaly Register": flagged,
+        "FY Summary":              fy_seg,
+        "Month-wise Summary":      month_summary,
     }
 
     currency_headers = {"Debit", "Credit", "Balance", "Total Credit", "Total Debit",
@@ -1515,11 +1646,30 @@ def main():
         st.divider()
         st.markdown(f'<div class="section-header">Upload Statement</div>', unsafe_allow_html=True)
 
-        uploaded = st.file_uploader(
-            "Drop a PDF, CSV, or Excel file",
-            type=["pdf", "csv", "xlsx", "xls"],
+        upload_mode = st.radio(
+            "Upload mode",
+            ["Single Statement", "Multiple Parts (merge & dedupe)"],
             label_visibility="collapsed",
+            help="Use 'Multiple Parts' when your bank only exports statements in "
+                 "date-limited chunks and you have several overlapping-period PDFs "
+                 "for the same account.",
         )
+
+        if upload_mode == "Single Statement":
+            uploaded = st.file_uploader(
+                "Drop a PDF, CSV, or Excel file",
+                type=["pdf", "csv", "xlsx", "xls"],
+                label_visibility="collapsed",
+            )
+            uploaded_multi = None
+        else:
+            uploaded_multi = st.file_uploader(
+                "Drop multiple PDF, CSV, or Excel parts",
+                type=["pdf", "csv", "xlsx", "xls"],
+                accept_multiple_files=True,
+                label_visibility="collapsed",
+            )
+            uploaded = None
 
         st.divider()
         st.markdown(f'<div class="section-header">Analysis Options</div>', unsafe_allow_html=True)
@@ -1534,7 +1684,8 @@ def main():
         st.caption(f"Privacy-first · Zero cloud APIs\nAll data stays on your machine.")
 
     # ── Main content ─────────────────────────────────────────────────────────
-    if not uploaded:
+    has_upload = bool(uploaded) or bool(uploaded_multi)
+    if not has_upload:
         # Landing / hero state
         st.markdown(f"""
         <div style="
@@ -1560,13 +1711,45 @@ def main():
         """, unsafe_allow_html=True)
         return
 
-    # ── Parse uploaded file ───────────────────────────────────────────────────
-    with st.spinner("Extracting and normalising statement data…"):
-        df_raw = load_and_parse(uploaded)
+    # ── Parse uploaded file(s) ────────────────────────────────────────────────
+    merge_stats = None
+    if uploaded_multi:
+        with st.spinner(f"Extracting and normalising {len(uploaded_multi)} statement part(s)…"):
+            per_file_dfs = [load_and_parse(f) for f in uploaded_multi]
+            filenames = [f.name for f in uploaded_multi]
+        df_raw, merge_stats = merge_and_dedupe_statements(per_file_dfs, filenames)
+    else:
+        with st.spinner("Extracting and normalising statement data…"):
+            df_raw = load_and_parse(uploaded)
 
     if df_raw.empty:
         st.error("❌ No usable data extracted from the file. Please check the format.")
         return
+
+    if merge_stats:
+        dup_count = merge_stats["duplicates_removed"]
+        with st.expander(
+            f"📋 Merge Report — {len(merge_stats['per_file'])} file(s), "
+            f"{dup_count} duplicate{'s' if dup_count != 1 else ''} removed, "
+            f"{merge_stats['total_after']} final transactions",
+            expanded=False,
+        ):
+            report_df = pd.DataFrame(merge_stats["per_file"])
+            if "Start" in report_df.columns:
+                for col in ["Start", "End"]:
+                    report_df[col] = pd.to_datetime(report_df[col]).dt.strftime("%d %b %Y")
+            render_styled_df(report_df, height=min(240, 60 + 35 * len(report_df)))
+            st.markdown(
+                f"**Total rows across all files:** {merge_stats['total_before']}  \n"
+                f"**Duplicate transactions removed:** {dup_count}  \n"
+                f"**Final merged transaction count:** {merge_stats['total_after']}"
+            )
+            for g in merge_stats["gaps"]:
+                st.warning(
+                    f"⚠️ Possible coverage gap: no transactions found between "
+                    f"**{g['gap_start'].strftime('%d %b %Y')}** and **{g['gap_end'].strftime('%d %b %Y')}** "
+                    f"(between *{g['after_file']}* and *{g['before_file']}*) — check whether a part is missing."
+                )
 
     # Counterparty extraction + deduplication
     with st.spinner("Extracting counterparties…"):
@@ -1608,11 +1791,12 @@ def main():
         )
 
     # ── TAB LAYOUT ────────────────────────────────────────────────────────────
-    tab1, tab2, tab3, tab4 = st.tabs([
+    tab1, tab2, tab3, tab4, tab5 = st.tabs([
         "📊 Executive Dashboard",
         "🧾 Tax & Expense Segregation",
         "🤝 Party Ledger & Netting",
         "🚨 Risk & Anomaly Register",
+        "📅 Annual Summary",
     ])
 
     # ═════════════════════════════════════════════════════════════════════════
@@ -1873,6 +2057,46 @@ def main():
         st.markdown("---")
         # Chat interface
         chat_with_statement(df, model=selected_model, ollama_ok=ollama_ok)
+
+    # ═════════════════════════════════════════════════════════════════════════
+    # TAB 5: ANNUAL SUMMARY
+    # ═════════════════════════════════════════════════════════════════════════
+    with tab5:
+        fy_summary, month_summary = build_annual_summary(df)
+
+        section_header("Financial Year Summary")
+        if "SourceFile" in df.columns:
+            st.caption(
+                f"Built from {df['SourceFile'].nunique()} merged statement file(s), "
+                f"{len(df)} deduplicated transactions."
+            )
+        fy_disp = fy_summary.copy()
+        fy_disp["Period Start"] = pd.to_datetime(fy_disp["Period Start"]).dt.strftime("%d %b %Y")
+        fy_disp["Period End"]   = pd.to_datetime(fy_disp["Period End"]).dt.strftime("%d %b %Y")
+        for col in ["Total Credit", "Total Debit", "Net Flow"]:
+            fy_disp[col] = fy_disp[col].map(fmt_inr)
+        render_styled_df(fy_disp, height=min(240, 90 + 40 * len(fy_disp)))
+
+        st.markdown("<br>", unsafe_allow_html=True)
+        section_header("Month-wise Breakdown")
+        month_disp = month_summary.copy()
+        for col in ["Total Credit", "Total Debit", "Net Flow"]:
+            month_disp[col] = month_disp[col].map(fmt_inr)
+        render_styled_df(month_disp, height=min(420, 90 + 35 * len(month_disp)))
+
+        st.markdown("<br>", unsafe_allow_html=True)
+        fig_month = go.Figure()
+        fig_month.add_trace(go.Bar(x=month_summary["Month"], y=month_summary["Total Credit"],
+                                    name="Credit", marker_color=ACCENT_GREEN, marker_opacity=0.85))
+        fig_month.add_trace(go.Bar(x=month_summary["Month"], y=-month_summary["Total Debit"],
+                                    name="Debit", marker_color=ACCENT_RED, marker_opacity=0.85))
+        fig_month.update_layout(
+            **{**PLOTLY_LAYOUT, "xaxis": {**PLOTLY_LAYOUT["xaxis"], "tickangle": -25}},
+            barmode="relative",
+            title=dict(text="Monthly Credit vs Debit", font=dict(size=13), x=0.01),
+            height=340,
+        )
+        st.plotly_chart(fig_month, use_container_width=True)
 
 
 if __name__ == "__main__":
