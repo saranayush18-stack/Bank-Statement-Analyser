@@ -682,6 +682,19 @@ def extract_from_pdf(file_obj) -> pd.DataFrame:
 
     all_rows = [_normalise(r, target_width) for r in all_rows]
 
+    # Merge multi-line-wrapped transaction rows. Many real bank statement
+    # PDFs wrap a long narration (UPI/NEFT references, etc.) across several
+    # visual lines within ONE logical transaction, with Date shown once and
+    # the Debit/Credit/Balance sometimes appearing on a different line within
+    # that block (e.g. vertically centered next to the wrapped text) rather
+    # than the first line. Line-by-line extraction otherwise scatters one
+    # transaction's date, narration, and amount across several bogus rows.
+    # This is a no-op for statements where every row already has its own
+    # date (the common case) — it only merges rows that lack a parseable
+    # date into the preceding transaction.
+    if header:
+        all_rows = _merge_wrapped_rows(all_rows, header)
+
     if header and len(header) == target_width:
         df = pd.DataFrame(all_rows, columns=header)
     else:
@@ -689,6 +702,48 @@ def extract_from_pdf(file_obj) -> pd.DataFrame:
         df.columns = [f"col_{i}" for i in range(len(df.columns))]
 
     return df
+
+
+def _merge_wrapped_rows(rows: list, header: list) -> list:
+    """
+    Group consecutive extracted rows into transaction blocks: a new block
+    starts at any row with a parseable date, and every following row without
+    a date is treated as a continuation (wrapped narration text, possibly
+    carrying the actual Debit/Credit/Balance if the source PDF places those
+    values on a line other than the first within the block). Description
+    text is concatenated across the whole block in order; each numeric
+    column takes the first non-empty value found anywhere in the block.
+    """
+    date_idx = next((i for i, h in enumerate(header) if _match_column(h, "date")), 0)
+    desc_idx = next((i for i, h in enumerate(header) if _match_column(h, "description")), None)
+    numeric_idxs = [
+        i for i, h in enumerate(header)
+        if _match_column(h, "debit") or _match_column(h, "credit")
+        or _match_column(h, "balance") or _match_column(h, "amount")
+    ]
+
+    blocks = []
+    for row in rows:
+        date_val = row[date_idx] if date_idx < len(row) else ""
+        if parse_date(date_val) is not None or not blocks:
+            blocks.append([list(row)])
+        else:
+            blocks[-1].append(list(row))
+
+    merged_rows = []
+    for block in blocks:
+        base = list(block[0])
+        if desc_idx is not None:
+            parts = [str(r[desc_idx]).strip() for r in block
+                     if desc_idx < len(r) and str(r[desc_idx]).strip()]
+            base[desc_idx] = " ".join(parts)
+        for idx in numeric_idxs:
+            for r in block:
+                if idx < len(r) and str(r[idx]).strip():
+                    base[idx] = r[idx]
+                    break
+        merged_rows.append(base)
+    return merged_rows
 
 
 def extract_from_csv(file_obj) -> pd.DataFrame:
@@ -824,9 +879,11 @@ def _ocr_fallback(raw_bytes: bytes) -> pd.DataFrame:
         if all_rows:
             max_cols = max(len(r) for r in all_rows)
             all_rows = [r + [""] * (max_cols - len(r)) for r in all_rows]
-            df = pd.DataFrame(all_rows)
             if header_labels and len(header_labels) == max_cols:
-                df.columns = header_labels
+                all_rows = _merge_wrapped_rows(all_rows, header_labels)
+                df = pd.DataFrame(all_rows, columns=header_labels)
+            else:
+                df = pd.DataFrame(all_rows)
             return df
     except Exception as e:
         st.warning(f"OCR fallback failed: {e}")
